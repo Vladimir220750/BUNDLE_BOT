@@ -1,0 +1,67 @@
+version: '3.8'
+services:
+  pumpfun_backend:
+    container_name: bundle-bot-backend
+    build: ./backend
+    env_file: ./backend/.env
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend/app:/app/app
+      - ./wallets:/data/wallets
+      - ./temp_wallets:/data/temp_wallets
+      - ./archive_wallets:/data/archive_wallets
+      - ./tokens:/data/tokens
+      - ./tmp:/data/tmp
+    networks:
+      - mvn
+    restart: always
+
+  frontend:
+    container_name: bundle-bot-frontend
+    build: ./frontend
+    command: npx sirv public --single --host 0.0.0.0 --port 5000
+    depends_on:
+      - pumpfun_backend
+    networks:
+      - mvn
+    restart: always
+
+  nginx:
+    image: nginx:alpine
+    container_name: bundle-bot-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - frontend
+      - pumpfun_backend
+      - raydium
+    networks:
+      - mvn
+    restart: always
+
+  raydium:
+    container_name: raydium-bot-backend
+    build: ./raydium
+    env_file: ./raydium/.env
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+    volumes:
+      - ./raydium/app:/app/app
+      - ./tmp:/data/tmp
+    depends_on:
+      - frontend
+      - pumpfun_backend
+    networks:
+      - mvn
+    restart: always
+
+volumes:
+  wallets:
+  tokens:
+  temp_wallets:
+
+networks:
+  mvn:
+    external: true
