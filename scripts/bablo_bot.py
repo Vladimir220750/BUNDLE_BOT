@@ -2,6 +2,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from typing import Optional, Any, Tuple, Callable
+import json
 
 PROFIT_THRESHOLD_SOL: float = 0.05
 TIMEOUT_SECONDS: int = 4
@@ -32,47 +33,168 @@ class PnL:
     ts: float
 
 async def copy_token_contract(source_contract: str) -> TokenBlueprint:
+    """Загрузить метаданные существующего токена.
+
+    В проекте уже существует готовая реализация –
+    :func:`backend.app.services.tokens.copy_token`. Здесь мы лишь
+    используем её и преобразуем ответ в локальный ``TokenBlueprint``.
     """
-    TODO: Скопируй токен: подтяни метаданные, decimals, возможно правила fee/transfer и т.д.
-    """
-    await asyncio.sleep(0.05)
+
+    from backend.app.core.constants import TOKEN_DECIMALS
+    from backend.app.services import tokens as token_service
+
+    # ``copy_token`` возвращает ``JSONResponse`` с нужными полями.
+    resp = await token_service.copy_token(source_contract)
+    if hasattr(resp, "body"):
+        meta = json.loads(resp.body)
+    else:  # уже dict
+        meta = resp
+
+    extra: dict[str, Any] = {}
+    for key in ("description", "telegram", "twitter", "website", "image", "image_base64"):
+        if meta.get(key) is not None:
+            extra[key] = meta[key]
+
     return TokenBlueprint(
-        name="ClonedToken",
-        symbol="CLONE",
-        decimals=9,
-        metadata_uri=None,
-        extra={"source": source_contract},
+        name=meta.get("name") or "",
+        symbol=meta.get("symbol") or "",
+        decimals=TOKEN_DECIMALS,
+        metadata_uri=meta.get("image"),
+        extra=extra,
     )
 
 async def create_token(blueprint: TokenBlueprint) -> Mint:
+    """Создание нового mint на основе скопированного токена.
+
+    Использует сервис ``tokens.create_token_raydium``. Перед созданием
+    сервис читает параметры токена из подготовленного файла. Поэтому
+    здесь мы просто делегируем выполнение существующей функции и
+    извлекаем адрес созданного mint через ``tokens.get_token``.
     """
-    TODO: Создай новый mint по скопированным параметрам. Верни адрес mint.
-    """
-    await asyncio.sleep(0.1)
-    return Mint(address="Mint111111111111111111111111111111111111111")
+
+    from backend.app.core.client import SolanaClient
+    from backend.app.core.config import settings
+    from backend.app.core.wallet_manager import WalletManager
+    from backend.app.services.tokens import create_token_raydium, get_token
+
+    solana_client = SolanaClient(settings.helius_rpc_url)
+    wm = WalletManager(solana_client)
+
+    # Сама логика создания токена уже реализована в сервисе
+    await create_token_raydium(solana_client, wm)
+
+    # Сервис сохраняет информацию о токене в файле, получаем её оттуда
+    token_info = await get_token("token_raydium.json")
+    return Mint(address=token_info.mint_address)
 
 async def create_pool(mint: Mint) -> Pool:
+    """Создать пул ликвидности для указанного mint.
+
+    В проекте уже есть сложный сервис инициализации пула Raydium –
+    :func:`raydium.app.services.initialize_pool.initialize_pool`. Он
+    сохраняет параметры пула в ``liq_pool/latest_pool.json``. После
+    вызова этой функции мы загружаем данные из файла и возвращаем адрес
+    пула.
     """
-    TODO: Создай пул ликвидности для указанного mint (например, на Raydium/Orca и т.п.).
-    Верни адрес пула.
-    """
-    await asyncio.sleep(0.1)
-    return Pool(address="Pool111111111111111111111111111111111111111", mint=mint)
+
+    from backend.app.core.client import SolanaClient
+    from backend.app.core.config import settings
+    from backend.app.core.wallet_manager import WalletManager
+    from backend.app.enums import Role
+    from raydium.app.services.initialize_pool import initialize_pool
+    from raydium.app.services.liquidity_pool import load_from_json
+
+    solana_client = SolanaClient(settings.helius_rpc_url)
+    wm = WalletManager(solana_client)
+    dev_wallet = (await wm.get_wallets_by_group(Role.dev))[0]
+
+    # Минимальные параметры для старта пула. Полная логика находится в сервисе
+    await initialize_pool(
+        solana_client=solana_client,
+        token_amount_ui=1,
+        wsol_amount_ui=1.0,
+        dev_wallet=dev_wallet,
+        sniper_wallets=[],
+        snipe_amount_ui=None,
+        created_token_string=mint.address,
+        random_pool_id=None,
+        transfer_fee=0,
+    )
+
+    pool_data = load_from_json()
+    return Pool(address=str(pool_data.pool_state), mint=mint)
 
 async def get_pool_pnl_sol(pool: Pool) -> PnL:
+    """Получить текущий PnL пула в SOL.
+
+    Для расчётов используется ``DataCollector`` – центральный агрегатор
+    данных в проекте. Он предоставляет информацию о состоянии bonding
+    curve и текущей ликвидности. Здесь мы обновляем состояние кривой и
+    считаем разницу между текущей ликвидностью и первоначальными
+    вложениями (по умолчанию 1 SOL при создании пула в ``create_pool``).
     """
-    TODO: Верни текущий PnL пула в SOL. Положительное значение — в плюс.
-    """
-    now = time.time()
-    growth = max(0.0, (now % 10) / 100.0)
-    return PnL(value_sol=growth, ts=now)
+
+    from solders.pubkey import Pubkey
+    from backend.app.core.client import SolanaClient
+    from backend.app.core.config import settings
+    from backend.app.core.wallet_manager import WalletManager
+    from backend.app.core.data_collector import DataCollector
+    from backend.app.services.tokens import get_token
+
+    solana_client = SolanaClient(settings.helius_rpc_url)
+    wm = WalletManager(solana_client)
+    dc = DataCollector(solana_client, wm)
+
+    token_info = await get_token("token_raydium.json")
+    bonding_curve = Pubkey.from_string(token_info.bonding_curve)
+
+    # get_price обновит состояние кривой внутри DataCollector
+    await dc.get_price(bonding_curve)
+    liquidity = await dc.get_liquidity()
+
+    pnl_val = liquidity - 1.0  # 1 SOL вложен при создании
+    return PnL(value_sol=pnl_val, ts=time.time())
 
 async def pull_liquidity(pool: Pool) -> str:
+    """Вывод ликвидности из пула.
+
+    Реализация основана на сервисе ``raydium.app.services.withdraw``.
+    Там уже есть логика подготовки инструкций и отправки транзакций, но
+    функция не возвращает сигнатуру. Здесь мы повторяем её шаги и
+    возвращаем подпись отправленной транзакции.
     """
-    TODO: Дёрнуть ликвидность из пула. Верни сигнатуру/ид транзы.
-    """
-    await asyncio.sleep(0.05)
-    return "Sig111111111111111111111111111111111111111111111111111111111111"
+
+    from spl.token.constants import WRAPPED_SOL_MINT
+    from spl.token.instructions import create_idempotent_associated_token_account
+    from raydium.app.instructions.amm_pool import build_withdraw_ix
+    from raydium.app.services.liquidity_pool import load_from_json
+    from backend.app.core.client import SolanaClient
+    from backend.app.core.config import settings
+
+    solana_client = SolanaClient(settings.helius_rpc_url)
+
+    tx_data = load_from_json()
+    owner_lp_balance = await solana_client.get_token_account_balance(tx_data.creator_lp_token)
+    if owner_lp_balance == 0:
+        owner_lp_balance = tx_data.lp_amount
+
+    withdraw_ix = build_withdraw_ix(tx_data=tx_data, lp_token_amount=owner_lp_balance)
+    create_wsol_ata_ix = create_idempotent_associated_token_account(
+        payer=tx_data.creator_kp.pubkey(),
+        owner=tx_data.creator_kp.pubkey(),
+        mint=WRAPPED_SOL_MINT,
+    )
+
+    sig = await solana_client.build_and_send_transaction(
+        instructions=[create_wsol_ata_ix, withdraw_ix],
+        msg_signer=tx_data.creator_kp,
+        signers_keypairs=[tx_data.creator_kp],
+        priority_fee=50_000,
+        max_retries=1,
+        label="WITHDRAW",
+        jito_tip=500_000,
+    )
+    return str(sig)
 
 def log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
