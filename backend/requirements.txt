@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-solana
-pydantic
-base58
-structlog
-loguru
-python-multipart
-pillow
