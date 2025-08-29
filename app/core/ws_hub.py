@@ -66,7 +66,9 @@ class WsHub:
                     if emit_initial:
                         pass
 
-                    reader = asyncio.create_task(self._read_loop(ws, pubkey, on_change, lambda v: self._should_emit(v, prev_lamports)))
+                    reader = asyncio.create_task(
+                        self._read_loop(ws, pubkey, on_change,
+                                        lambda v: self._should_emit(v, prev_lamports)))
                     pinger = asyncio.create_task(self._ping_loop(ws))
 
                     done, pending = await asyncio.wait(
