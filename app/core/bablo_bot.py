@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
 import httpx
@@ -20,16 +21,14 @@ from spl.token.instructions import (
     set_authority, SetAuthorityParams, AuthorityType,
     sync_native, SyncNativeParams, close_account, CloseAccountParams
 )
+
 from .dto import TokenDTO, LiquidityPoolData
 from .client import SolanaClient
 from .constants import (
     TOKEN_DECIMALS, TOKEN_WITH_DECIMALS,
-    TOKEN_PROGRAM_2022_ID,
-    TOKEN_PROGRAM_ID,
-    SOL_WRAPPED_MINT,
-    LAMPORTS_PER_SOL,
-    MILLION,
-    RAYDIUM_CP_PROGRAM_ID, HELIUS_HTTPS
+    TOKEN_PROGRAM_2022_ID, TOKEN_PROGRAM_ID,
+    SOL_WRAPPED_MINT, LAMPORTS_PER_SOL, MILLION,
+    RAYDIUM_CP_PROGRAM_ID, HELIUS_HTTPS,
 )
 from .ix_builders import (
     build_initialize_transfer_fee_config_ix,
@@ -39,58 +38,58 @@ from .ix_builders import (
     build_initialize_pool_ix,
     build_withdraw_ix,
 )
-from .ws_hub import WsHub
 from .utils import (
     sol_to_lamports,
     lamports_to_sol,
-    tokens_base_units_to_ui,
     tokens_ui_to_base_units,
     calculate_lp_tokens,
     get_token_amount_after_fee,
-    get_amm_config_address,
-    get_pool_address,
-    get_authority_address,
-    get_pool_vault_address,
-    get_oracle_account_address,
-    get_pool_lp_mint_address,
-    get_creator_lp_mint
+    get_amm_config_address, get_pool_address, get_authority_address,
+    get_pool_vault_address, get_oracle_account_address, get_pool_lp_mint_address,
 )
+from .ws_hub import WsHub
+from .wallet_manager import WalletManager
+from .logger import logger as log
 
 @dataclass
 class BabloConfig:
-    token_amount_ui: list[int]
-    wsol_amount_ui: list[float]
+    token_amount_ui: list[int] = field(default_factory=lambda: [1000])
+    wsol_amount_ui: list[float] = field(default_factory=lambda: [3.0])
     profit_threshold_sol: float = 0.05
     cycle_timeout_sec: int = 120
-    mode: str = "manual"
+    mode: str = "manual"               # "manual" | "auto"
+    auto_sleep_sec: int = 300          # пауза между авто-циклами
 
 OnStatus = Callable[[str], Awaitable[None]]
-OnAlert = Callable[[str], Awaitable[None]]
-GetCA = Callable[[], Awaitable[str]]
+OnAlert  = Callable[[str], Awaitable[None]]
+GetCA    = Callable[[], Awaitable[str]]
+GetCAAuto= Callable[[], Awaitable[Optional[str]]]
 
 CREATE_MINT_ACCOUNT_LAMPORTS = 5_066_880
 CREATE_MINT_ACCOUNT_SPACE = 346
 LAUNCH_COST_SOL = 0.217
-
-MAX_TRANSFER_FEE = 1_000_000_000
 TRANSFER_FEE_BPS = 1000
+FUND_SEED_BUFFER_SOL = 0.30
 
 class Bablo:
     def __init__(
         self,
-        cfg: BabloConfig,
+        cfg: Optional[BabloConfig] = None,
         *,
         on_status: Optional[OnStatus] = None,
         on_alert: Optional[OnAlert] = None,
-        get_ca: Optional[GetCA] = None,
+        get_ca: Optional[GetCA] = None,            # manual
+        get_ca_auto: Optional[GetCAAuto] = None,   # auto (может вернуть None → заснём)
     ):
-        self.cfg = cfg
+        self._cfg = cfg or BabloConfig()
         self.on_status: OnStatus = on_status or (lambda s: asyncio.sleep(0))
-        self.on_alert: OnAlert = on_alert or (lambda s: asyncio.sleep(0))
+        self.on_alert:  OnAlert  = on_alert  or (lambda s: asyncio.sleep(0))
         self.get_ca: Optional[GetCA] = get_ca
+        self.get_ca_auto: Optional[GetCAAuto] = get_ca_auto
 
         self._client = SolanaClient(HELIUS_HTTPS, max_calls=50)
         self._ws = WsHub()
+        self._wm = WalletManager(self._client)
 
         self._stop_event = asyncio.Event()
         self._worker_task: Optional[asyncio.Task] = None
@@ -98,26 +97,24 @@ class Bablo:
 
         self.original_mint: Optional[Pubkey] = None
         self.token: Optional[TokenDTO] = None
-        self.dev: Optional[Keypair] = None
         self.pool: Optional[LiquidityPoolData] = None
         self.tx_create_token: Optional[str] = None
         self.tx_init_pool: Optional[str] = None
         self.tx_withdraw: Optional[str] = None
 
-        self.token_amount = 0
-        self.token_amount_ui = 0.0
-        self.lamports_amount = 0
-        self.wsol_amount_ui = 0.0
-
         self.decimals = TOKEN_DECIMALS
+        self.token_amount_ui = 0
+        self.token_amount = 0
+        self.wsol_amount_ui = 0.0
+        self.lamports_amount = 0
 
-    def set_token_amount(self):
-        self.token_amount_ui = self.cfg.token_amount_ui[0] #Randomize this
-        self.token_amount = tokens_ui_to_base_units(self.token_amount_ui, self.decimals)
+    def get_config(self) -> BabloConfig:
+        return self._cfg
 
-    def set_wsol_amount(self):
-        self.wsol_amount_ui = self.cfg.wsol_amount_ui[0] #Randomize this
-        self.lamports_amount = sol_to_lamports(self.wsol_amount_ui)
+    def set_config(self, cfg: BabloConfig):
+        if self._worker_task and not self._worker_task.done():
+            raise RuntimeError("Нельзя менять конфиг, пока Bablo запущен. Останови сначала.")
+        self._cfg = cfg
 
     def start(self):
         if self._worker_task and not self._worker_task.done():
@@ -142,44 +139,78 @@ class Bablo:
 
     async def working_loop(self):
         try:
-            if self._stopped(): return
-            self.set_token_amount()
-            self.set_wsol_amount()
+            while not self._stopped():
+                self.token_amount_ui = random.choice(self._cfg.token_amount_ui)
+                self.wsol_amount_ui  = float(random.choice(self._cfg.wsol_amount_ui))
+                self.token_amount    = tokens_ui_to_base_units(self.token_amount_ui, self.decimals)
+                self.lamports_amount = sol_to_lamports(self.wsol_amount_ui)
 
-            ca = await self.get_contract_address()
+                ca = await self._next_contract_address()
+                if ca is None:
+                    await asyncio.sleep(self._cfg.auto_sleep_sec)
+                    continue
+
+                seed_target = self.lamports_amount + sol_to_lamports(FUND_SEED_BUFFER_SOL)
+                added = await self._ensure_dev_funded(seed_target)
+                if added:
+                    await self._say(f"Dev докинут на {added} лампорт(ов).")
+                await self._cycle(ca)
+                await self._wm.rollover_dev(seed_lamports=seed_target)
+
+                if self._cfg.mode == "auto":
+                    await asyncio.sleep(self._cfg.auto_sleep_sec)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception("Bablo loop crashed")
+            await self._yel(f"Ошибка рабочего цикла: `{e}`")
+
+    async def _next_contract_address(self) -> Optional[str]:
+        """Решает, когда и какой CA брать для запуска следующего цикла."""
+        if self._cfg.mode == "manual":
+            if not self.get_ca:
+                await self._yel("manual-режим: не передан get_ca callback")
+                await asyncio.sleep(1.0)
+                return None
+            ca = await self.get_ca()
             await self._say(f"CA получен: `{ca}`")
+            return ca
+
+        if self.get_ca_auto:
+            ca = await self.get_ca_auto()
+            if ca:
+                await self._say(f"[auto] найден CA: `{ca}`")
+                return ca
+            else:
+                await self._say(f"[auto] кандидат не найден, сплю {self._cfg.auto_sleep_sec}s")
+                return None
+
+        await self._say(f"[auto] нет провайдера CA. Сплю {self._cfg.auto_sleep_sec}s")
+        return None
+
+    async def _cycle(self, ca: str):
+        try:
             self.original_mint = Pubkey.from_string(ca)
 
             self.token = await self._copy_token_metadata(ca)
             await self._say(f"Метаданные: {self.token.name} ({self.token.symbol})")
 
-            self.tx_create_token = await self.create_token()
+            self.tx_create_token = await self._create_token(self._wm.dev)
             await self._say(f"Создан mint: `{self.token.keypair.pubkey()}`; tx: `{self.tx_create_token}`")
 
-            self.pool = await self.prepare_liquidity_pool()
-            self.tx_init_pool = await self.initialize_pool()
+            self.pool = await self._prepare_liquidity_pool(self._wm.dev)
+            self.tx_init_pool = await self._initialize_pool(self._wm.dev)
             await self._say(f"Пул инициирован: `{self.pool.pool_state}`; tx: `{self.tx_init_pool}`")
 
-            await self.start_monitoring_liquidity()
-
-            timer = asyncio.create_task(asyncio.sleep(self.cfg.cycle_timeout_sec), name="bablo-timer")
             pnl_event = asyncio.Event()
+            self._pnl_task = asyncio.create_task(self._monitor_pnl_wrapper(self.pool.liq_vault, pnl_event))
 
-            self._pnl_task = asyncio.create_task(
-                self._monitor_pnl_wrapper(pnl_event),
-                name="bablo-pnl"
-            )
+            timer = asyncio.create_task(asyncio.sleep(self._cfg.cycle_timeout_sec), name="bablo-timer")
+            done, _ = await asyncio.wait({timer, pnl_event.wait()}, return_when=asyncio.FIRST_COMPLETED)
 
-            done, _ = await asyncio.wait({timer, pnl_event.wait()},
-                                         return_when=asyncio.FIRST_COMPLETED)
-
-            self.tx_withdraw = await self.withdraw_liquidity()
+            self.tx_withdraw = await self._withdraw_liquidity(self.pool)
             await self._say(f"Withdraw выполнен. tx: `{self.tx_withdraw}`")
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            await self._yel(f"Ошибка: `{e}`")
         finally:
             if self._pnl_task and not self._pnl_task.done():
                 self._pnl_task.cancel()
@@ -187,16 +218,6 @@ class Bablo:
                     await self._pnl_task
                 except asyncio.CancelledError:
                     pass
-
-    async def get_contract_address(self) -> str:
-        if self.cfg.mode == "manual":
-            if not self.get_ca:
-                raise RuntimeError("get_ca callback не передан для manual-режима")
-            return await self.get_ca()
-        elif self.cfg.mode == "auto":
-            raise NotImplementedError("Auto-режим ещё не реализован в этом классе.")
-        else:
-            raise ValueError(f"Неизвестный режим: {self.cfg.mode}")
 
     @staticmethod
     async def _copy_token_metadata(original_mint_str: str) -> TokenDTO:
@@ -225,13 +246,11 @@ class Bablo:
             keypair=mint_kp,
         )
 
-    async def create_token(self) -> str:
-        assert self.token and self.dev
-
+    async def _create_token(self, dev: Keypair) -> str:
+        assert self.token
         ixs: list[Instruction] = []
-
         ixs.append(create_account(CreateAccountParams(
-            from_pubkey=self.dev.pubkey(),
+            from_pubkey=dev.pubkey(),
             to_pubkey=self.token.keypair.pubkey(),
             lamports=CREATE_MINT_ACCOUNT_LAMPORTS,
             space=CREATE_MINT_ACCOUNT_SPACE,
@@ -239,67 +258,64 @@ class Bablo:
         )))
         ixs.append(build_initialize_transfer_fee_config_ix(
             mint=self.token.keypair.pubkey(),
-            authority=self.dev.pubkey(),
-            basis_points=1000,
+            authority=dev.pubkey(),
+            basis_points=TRANSFER_FEE_BPS,
             max_fee=1_000_000_000 * TOKEN_WITH_DECIMALS,
         ))
         ixs.append(build_initialize_metadata_pointer_ix(
             mint=self.token.keypair.pubkey(),
-            authority=self.dev.pubkey(),
+            authority=dev.pubkey(),
             metadata_address=self.token.keypair.pubkey()
         ))
         ixs.append(build_initialize_mint_ix(
             mint=self.token.keypair.pubkey(),
-            mint_authority=self.dev.pubkey(),
-            freeze_authority=self.dev.pubkey(),
+            mint_authority=dev.pubkey(),
+            freeze_authority=dev.pubkey(),
             decimals=TOKEN_DECIMALS,
         ))
         ixs.append(build_initialize_token_metadata_ix(
             metadata=self.token.keypair.pubkey(),
-            update_authority=self.dev.pubkey(),
+            update_authority=dev.pubkey(),
             mint=self.token.keypair.pubkey(),
-            mint_authority=self.dev.pubkey(),
+            mint_authority=dev.pubkey(),
             name=self.token.name,
             symbol=self.token.symbol,
             uri=self.token.uri,
         ))
         ixs.append(create_associated_token_account(
-            payer=self.dev.pubkey(),
-            owner=self.dev.pubkey(),
+            payer=dev.pubkey(),
+            owner=dev.pubkey(),
             mint=self.token.keypair.pubkey(),
             token_program_id=TOKEN_PROGRAM_2022_ID,
         ))
         ixs.append(mint_to_checked(MintToCheckedParams(
             program_id=TOKEN_PROGRAM_2022_ID,
             mint=self.token.keypair.pubkey(),
-            dest=get_associated_token_address(
-                owner=self.dev.pubkey(),
-                mint=self.token.keypair.pubkey(),
-                token_program_id=TOKEN_PROGRAM_2022_ID,
-            ),
-            mint_authority=self.dev.pubkey(),
-            amount=self.cfg.token_amount_ui * TOKEN_WITH_DECIMALS * MILLION,
+            dest=get_associated_token_address(owner=dev.pubkey(), mint=self.token.keypair.pubkey(), token_program_id=TOKEN_PROGRAM_2022_ID),
+            mint_authority=dev.pubkey(),
+            amount=self.token_amount,
             decimals=TOKEN_DECIMALS,
         )))
+        # снять авторитеты
         ixs.append(set_authority(SetAuthorityParams(
             program_id=TOKEN_PROGRAM_2022_ID,
             account=self.token.keypair.pubkey(),
             authority=AuthorityType.MINT_TOKENS,
-            current_authority=self.dev.pubkey(),
+            current_authority=dev.pubkey(),
             new_authority=None,
         )))
         ixs.append(set_authority(SetAuthorityParams(
             program_id=TOKEN_PROGRAM_2022_ID,
             account=self.token.keypair.pubkey(),
             authority=AuthorityType.FREEZE_ACCOUNT,
-            current_authority=self.dev.pubkey(),
+            current_authority=dev.pubkey(),
             new_authority=None,
         )))
 
         sig, _ = await self._client.build_and_send_transaction(
             instructions=ixs,
-            msg_signer=self.dev,
-            signers_keypairs=[self.token.keypair, self.dev],
+            msg_signer=dev,
+            signers_keypairs=[self.token.keypair, dev],
             label="CREATE TOKEN-2022",
             max_retries=1,
             max_confirm_retries=10,
@@ -307,10 +323,10 @@ class Bablo:
         )
         return str(sig)
 
-    async def prepare_liquidity_pool(self) -> LiquidityPoolData:
-        assert self.dev and self.token
+    async def _prepare_liquidity_pool(self, dev: Keypair) -> LiquidityPoolData:
+        assert self.token
         created_token_mint = self.token.keypair.pubkey()
-        creator = self.dev.pubkey()
+        creator = dev.pubkey()
 
         token_ata = get_associated_token_address(owner=creator, mint=created_token_mint, token_program_id=TOKEN_PROGRAM_2022_ID)
         wsol_ata = get_associated_token_address(owner=creator, mint=SOL_WRAPPED_MINT)
@@ -337,11 +353,10 @@ class Bablo:
         token0_vault = get_pool_vault_address(pool=pool_state, vault_token_mint=token_mint0, program_id=program_id)
         token1_vault = get_pool_vault_address(pool=pool_state, vault_token_mint=token_mint1, program_id=program_id)
         observation = get_oracle_account_address(pool=pool_state, program_id=program_id)
-
         liq_vault = token1_vault if is_token_first else token0_vault
 
         self.pool = LiquidityPoolData(
-            creator_kp=self.dev,
+            creator_kp=dev,
             token_mint0=token_mint0,
             token_mint1=token_mint1,
             token_0_program=token_0_program,
@@ -364,15 +379,11 @@ class Bablo:
         )
         return self.pool
 
-    async def initialize_pool(self) -> str:
-        assert self.pool and self.dev and self.token
-        dev = self.dev
-
+    async def _initialize_pool(self, dev: Keypair) -> str:
+        assert self.pool
         wsol_ata = get_associated_token_address(owner=dev.pubkey(), mint=SOL_WRAPPED_MINT)
 
-        create_wsol_ata_ix = create_idempotent_associated_token_account(
-            payer=dev.pubkey(), owner=dev.pubkey(), mint=SOL_WRAPPED_MINT
-        )
+        create_wsol_ata_ix = create_idempotent_associated_token_account(payer=dev.pubkey(), owner=dev.pubkey(), mint=SOL_WRAPPED_MINT)
         transfer_sol_ix = transfer(TransferParams(from_pubkey=dev.pubkey(), to_pubkey=wsol_ata, lamports=self.lamports_amount))
         sync_native_ix = sync_native(SyncNativeParams(account=wsol_ata, program_id=TOKEN_PROGRAM_ID))
         init_ix = build_initialize_pool_ix(tx_data=self.pool, open_time_unix=int(time.time()))
@@ -387,26 +398,11 @@ class Bablo:
         )
         return str(sig)
 
-    async def start_monitoring_liquidity(self) -> None:
-        if not self.pool:
-            raise RuntimeError("Пул не подготовлен")
-
-    async def withdraw_liquidity(self) -> str:
-        assert self.pool
-        txd = self.pool
+    async def _withdraw_liquidity(self, txd: LiquidityPoolData) -> str:
         withdraw_ix = build_withdraw_ix(tx_data=txd, lp_token_amount=txd.lp_amount or 0)
-        create_wsol_ata_ix = create_idempotent_associated_token_account(payer=txd.creator_kp.pubkey(),
-                                                                        owner=txd.creator_kp.pubkey(),
-                                                                        mint=SOL_WRAPPED_MINT)
+        create_wsol_ata_ix = create_idempotent_associated_token_account(payer=txd.creator_kp.pubkey(), owner=txd.creator_kp.pubkey(), mint=SOL_WRAPPED_MINT)
         wsol_ata = get_associated_token_address(owner=txd.creator_kp.pubkey(), mint=SOL_WRAPPED_MINT)
-        close_wsol_ata_ix = close_account(
-            CloseAccountParams(
-                program_id=TOKEN_PROGRAM_ID,
-                account=wsol_ata,
-                dest=txd.creator_kp.pubkey(),
-                owner=txd.creator_kp.pubkey()
-            )
-        )
+        close_wsol_ata_ix = close_account(CloseAccountParams(program_id=TOKEN_PROGRAM_ID, account=wsol_ata, dest=txd.creator_kp.pubkey(), owner=txd.creator_kp.pubkey()))
         sig, _ = await self._client.build_and_send_transaction(
             instructions=[create_wsol_ata_ix, withdraw_ix, close_wsol_ata_ix],
             msg_signer=txd.creator_kp,
@@ -418,46 +414,37 @@ class Bablo:
         )
         return str(sig)
 
-    async def _monitor_pnl_wrapper(self, event: asyncio.Event):
-        assert self.pool
-        sol_vault = self.pool.liq_vault
-
+    async def _monitor_pnl_wrapper(self, sol_vault: Pubkey, event: asyncio.Event):
+        init_sol = self.wsol_amount_ui
         async def on_value(lamports: int):
             current_sol = lamports / LAMPORTS_PER_SOL
-            pnl = current_sol - lamports_to_sol(self.lamports_amount) - LAUNCH_COST_SOL
+            pnl = current_sol - init_sol - LAUNCH_COST_SOL
             log.info("WS: SOL=%.6f, PnL=%.6f", current_sol, pnl)
-            if pnl >= self.cfg.profit_threshold_sol:
+            if pnl >= self._cfg.profit_threshold_sol:
                 event.set()
 
         stop = asyncio.Event()
         try:
-            await self._ws.monitor_account_lamports(str(sol_vault), stop_event=stop, on_value=on_value)
+            await self._ws.monitor_account_lamports(str(sol_vault), on_change=on_value, stop_event=stop)
         except asyncio.CancelledError:
             pass
         finally:
             stop.set()
 
-    async def _wait_funding(self, pubkey: Pubkey, *, min_sol: float, timeout: int) -> bool:
-        ddl = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < ddl and not self._stopped():
-            bal = await self._client.get_balance_sol(pubkey)
-            await self._say(f"Баланс `{pubkey}`: {bal:.4f} SOL")
-            if bal >= min_sol:
-                return True
-            await asyncio.sleep(2.0)
-        return False
-
     async def _say(self, text: str):
-        try:
-            await self.on_status(text)
-        except Exception:
-            pass
+        try: await self.on_status(text)
+        except Exception: pass
 
     async def _yel(self, text: str):
-        try:
-            await self.on_alert(text)
-        except Exception:
-            pass
+        try: await self.on_alert(text)
+        except Exception: pass
 
     def _stopped(self) -> bool:
         return self._stop_event.is_set()
+
+    async def _ensure_dev_funded(self, target_lamports: int) -> int:
+        lamports_balance = (await self._client.get_multiple_accounts_lamports_balances([self._wm.dev_pubkey]))[0]
+        shortfall = max(0, target_lamports - lamports_balance)
+        if shortfall > 0:
+            await self._wm.distribute_lamports(shortfall)
+        return shortfall

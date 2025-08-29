@@ -2,17 +2,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time as dtime
-from typing import Optional, Callable
+from typing import Optional
 import os
+from html import escape
 from solders.keypair import Keypair
 
 from aiogram import Bot
 
-# Импорты из твоего core:
+# Импорты из core
 from app.core.bablo_bot import Bablo, BabloConfig
 from app.core.constants import LAMPORTS_PER_SOL
 from app.core.utils import lamports_to_sol  # если потребуется
-from app.core.wallet_manager import WalletManager     # у тебя этот класс в utils.py
+from app.core.wallet_manager import WalletManager     # у тебя этот класс в wallet_manager.py
 from app.core.client import SolanaClient     # как в твоих модулях
 
 from .config import AppConfig, save_config
@@ -20,12 +21,13 @@ from .telelog import TelegramLogHandler
 
 log = logging.getLogger("tg-controller")
 
+
 class BabloController:
     """
     Оркестратор: держит конфиг, кошельки, инстанс Bablo, шлёт статусы в ТГ,
     даёт команды start/stop и управляет автозапусками по расписанию.
     """
-    def __init__(self, cfg: AppConfig, bot: Bot, admin_chat_id: int):
+    def __init__(self, cfg: AppConfig, bot: Optional[Bot], admin_chat_id: Optional[int]):
         self.cfg = cfg
         self.bot = bot
         self.admin_chat_id = admin_chat_id
@@ -38,23 +40,42 @@ class BabloController:
         self._autorun_task: Optional[asyncio.Task] = None
         self._run_lock = asyncio.Lock()
 
-        # Лог в ТГ
+        # Лог в ТГ (установим только если есть бот и admin)
         self._install_telemetry_logger()
 
     # ---------- Logger to Telegram ----------
     def _install_telemetry_logger(self):
-        handler = TelegramLogHandler(
-            send_fn=self.bot.send_message,
-            chat_id=self.admin_chat_id,
-            level=logging.INFO
-        )
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        handler.setFormatter(formatter)
-        logging.getLogger().addHandler(handler)
+        # Не создаём handler если нет бота или admin id — предотвращаем AttributeError при ранней инициализации
+        if self.bot is None or self.admin_chat_id is None:
+            log.debug("Telegram logger not installed: bot or admin_chat_id is None")
+            return
+
+        try:
+            # Передаём прямую ссылку на send_message; TelegramLogHandler работает с async send_fn
+            handler = TelegramLogHandler(
+                send_fn=self.bot.send_message,
+                chat_id=self.admin_chat_id,
+                level=logging.INFO
+            )
+            formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+            handler.setFormatter(formatter)
+            logging.getLogger().addHandler(handler)
+            log.debug("Telegram telemetry logger installed")
+        except Exception as e:
+            log.exception("Failed to install TelegramLogHandler: %s", e)
 
     # ---------- Helpers ----------
-    async def _send(self, text: str):
-        await self.bot.send_message(self.admin_chat_id, text)
+    async def _send(self, text: str, *, parse_mode: str = "HTML"):
+        """
+        Безопасно шлём сообщение админу. Экранируем динамику заранее в коде вызова.
+        """
+        if self.bot is None or self.admin_chat_id is None:
+            log.warning("Attempt to send message but bot/admin_chat_id not set: %s", text)
+            return
+        try:
+            await self.bot.send_message(self.admin_chat_id, text, parse_mode=parse_mode)
+        except Exception as e:
+            log.exception("Failed to send message to admin: %s", e)
 
     def _build_bablo(self) -> Bablo:
         bc = self.cfg.bablo
@@ -67,12 +88,14 @@ class BabloController:
             mode=bc.mode,
         )
 
-        # Коллбэки в ТГ
+        # Коллбэки в ТГ - экранируем динамику в <pre>
         async def on_status(msg: str):
-            await self.bot.send_message(self.admin_chat_id, f"🟢 <b>Status</b>\n{msg}", parse_mode="HTML")
+            safe = escape(str(msg))
+            await self._send(f"🟢 <b>Status</b>\n<pre>{safe}</pre>")
 
         async def on_alert(msg: str):
-            await self.bot.send_message(self.admin_chat_id, f"🟠 <b>Alert</b>\n{msg}", parse_mode="HTML")
+            safe = escape(str(msg))
+            await self._send(f"🟠 <b>Alert</b>\n<pre>{safe}</pre>")
 
         async def get_ca() -> str:
             ca = self.cfg.bablo.last_ca
@@ -90,19 +113,25 @@ class BabloController:
 
     async def _ensure_wallets(self):
         if self.wallets is None:
-            # В твоей базе WalletManager требует SolanaClient
-            # Берём такой же endpoint, как использует твой core (Bablo сам делает свой клиент — ок).
-            client = SolanaClient  # заглушка если нужна; либо создай экземпляр, если твой SolanaClient класс — не статический
-            # Твой WalletManager принимает экземпляр клиента; здесь оставим None если не требуется.
-            # Простой путь: сделать WalletManager «ленивым» от твоего кода (он создаёт dev сам).
-            self.wallets = WalletManager(client=None)  # type: ignore[arg-type]
+            # Создаём WalletManager лениво. WalletManager в твоём проекте может требовать SolanaClient экземпляр.
+            # Здесь передаём None если конструкция позволяет — в противном случае нужно создать SolanaClient(...) и передать.
+            try:
+                self.wallets = WalletManager(client=None)  # type: ignore[arg-type]
+            except Exception:
+                # Попробуем через реальный клиент (fallback)
+                try:
+                    client = SolanaClient(os.getenv("RPC_HTTP_URL", ""))
+                    self.wallets = WalletManager(client=client)  # type: ignore[arg-type]
+                except Exception as e:
+                    log.exception("Failed to create WalletManager: %s", e)
+                    raise
         return self.wallets
 
     # ---------- Public API ----------
     async def set_ca(self, ca: str):
         self.cfg.bablo.last_ca = ca.strip()
         save_config(self.cfg)
-        await self._send(f"📌 Установлен CA: <code>{self.cfg.bablo.last_ca}</code>")
+        await self._send(f"📌 Установлен CA: <code>{escape(self.cfg.bablo.last_ca)}</code>")
 
     async def set_param(self, key: str, value: str):
         bcfg = self.cfg.bablo
@@ -142,33 +171,7 @@ class BabloController:
             raise ValueError(f"Неизвестный параметр: {key}")
 
         save_config(self.cfg)
-        await self._send(f"✅ Параметр <b>{key}</b> обновлён.")
-
-    '''async def run_once(self):
-        async with self._run_lock:
-            if self.bablo is not None and self.bablo._worker_task and not self.bablo._worker_task.done():
-                await self._send("⚠️ Уже выполняется цикл. Сначала /stop.")
-                return
-
-            # Подготовка Bablo + кошельки
-            self.bablo = self._build_bablo()
-            wallets = await self._ensure_wallets()
-            # подключаем dev в Bablo
-            self.bablo.dev = wallets.dev
-
-            # info dump
-            await self._send(
-                "▶️ Старт цикла\n"
-                f"• mode: <code>{self.cfg.bablo.mode}</code>\n"
-                f"• token_amount_ui: <code>{self.cfg.bablo.token_amount_ui}</code>\n"
-                f"• wsol_amount_ui: <code>{self.cfg.bablo.wsol_amount_ui}</code>\n"
-                f"• profit_threshold: <code>{self.cfg.bablo.profit_threshold_sol} SOL</code>\n"
-                f"• timeout: <code>{self.cfg.bablo.cycle_timeout_sec}s</code>\n"
-                f"• dev pubkey: <code>{wallets.dev_pubkey}</code>"
-            )
-
-            # запуск
-            self.bablo.start()'''
+        await self._send(f"✅ Параметр <b>{escape(key)}</b> обновлён.")
 
     async def run_once(self):
         async with self._run_lock:
@@ -187,15 +190,17 @@ class BabloController:
                 self.bablo.dev = wallets.dev
                 dev_pub = wallets.dev_pubkey
 
-            await self._send(
+            # Собираем безопасное сообщение (экранируем динамику)
+            msg = (
                 "▶️ Старт цикла\n"
-                f"• mode: <code>{self.cfg.bablo.mode}</code>\n"
-                f"• token_amount_ui: <code>{self.cfg.bablo.token_amount_ui}</code>\n"
-                f"• wsol_amount_ui: <code>{self.cfg.bablo.wsol_amount_ui}</code>\n"
-                f"• profit_threshold: <code>{self.cfg.bablo.profit_threshold_sol} SOL</code>\n"
-                f"• timeout: <code>{self.cfg.bablo.cycle_timeout_sec}s</code>\n"
-                f"• dev pubkey: <code>{dev_pub}</code>"
+                f"• mode: <code>{escape(str(self.cfg.bablo.mode))}</code>\n"
+                f"• token_amount_ui: <code>{escape(str(self.cfg.bablo.token_amount_ui))}</code>\n"
+                f"• wsol_amount_ui: <code>{escape(str(self.cfg.bablo.wsol_amount_ui))}</code>\n"
+                f"• profit_threshold: <code>{escape(str(self.cfg.bablo.profit_threshold_sol))} SOL</code>\n"
+                f"• timeout: <code>{escape(str(self.cfg.bablo.cycle_timeout_sec))}s</code>\n"
+                f"• dev pubkey: <code>{escape(str(dev_pub))}</code>"
             )
+            await self._send(msg)
             self.bablo.start()
 
     async def stop(self):
@@ -209,9 +214,11 @@ class BabloController:
 
     def _within_active_window(self) -> bool:
         sched = self.cfg.bablo.schedule
+
         def _parse(hhmm: str) -> dtime:
             hh, mm = [int(x) for x in hhmm.split(":")]
             return dtime(hh, mm)
+
         now = datetime.now().time()
         a, b = _parse(sched.active_from), _parse(sched.active_to)
         if a <= b:

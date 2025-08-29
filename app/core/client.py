@@ -20,7 +20,7 @@ from solders.solders import SimulateTransactionResp, AccountJSON, Account
 from solders.transaction import Transaction
 from solders.system_program import transfer, TransferParams
 
-from app.core.logger import logger
+from .logger import logger
 
 class AsyncRateLimiter:
     def __init__(self, max_calls: int, per_seconds: float):
@@ -345,7 +345,7 @@ class SolanaClient:
             instructions = [tip_ix, *instructions]
 
         message = Message(instructions, msg_signer.pubkey())
-        transaction = Transaction(signers_keypairs, message, recent_blockhash.value.blockhash)
+        transaction = Transaction(signers_keypairs, message, recent_blockhash)
 
         logger.info(f"Transaction size: {len(bytes(transaction))} bytes")
         success = False
@@ -414,7 +414,7 @@ class SolanaClient:
         client = await self.get_client()
         recent_blockhash = await self._execute_with_retry(lambda: self.get_latest_blockhash())
         message = Message(instructions, msg_signer.pubkey())
-        transaction = Transaction(signers_keypairs, message, recent_blockhash.value.blockhash)
+        transaction = Transaction(signers_keypairs, message, recent_blockhash)
         logger.info(f"Transaction size: {len(bytes(transaction))} bytes")
 
         return await self._execute_with_retry(lambda: client.simulate_transaction(

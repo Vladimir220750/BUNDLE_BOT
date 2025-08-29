@@ -1,17 +1,14 @@
-import os
 import sys
 import structlog
 from loguru import logger as loguru_logger
+from .config import settings
 
-
-def setup_logger(service_name: str):
+def setup_logger(service_name: str, level: str = settings.log_level):
     """
     Configures a non-blocking async-friendly logger using structlog + loguru.
     """
 
     import logging
-
-    level = os.getenv("LOG_LEVEL", "INFO")
     logging.basicConfig(level=level.upper())
 
     loguru_logger.remove()
@@ -41,6 +38,5 @@ def setup_logger(service_name: str):
     )
 
     return structlog.get_logger(service=service_name)
-
 
 logger = setup_logger("bundle_bot")

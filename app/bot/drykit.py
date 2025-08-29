@@ -5,8 +5,9 @@ import time
 from typing import Tuple
 from solders.keypair import Keypair
 
-from app.core.bablo import Bablo
-from app.core.constants import LAMPORTS_PER_SOL, TokenDTO
+from app.core.bablo_bot import Bablo
+from app.core.constants import LAMPORTS_PER_SOL
+from app.core.dto import TokenDTO
 from app.core.client import SolanaClient
 from app.core.ws_hub import WsHub
 
