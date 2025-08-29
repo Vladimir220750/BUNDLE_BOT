@@ -20,7 +20,7 @@ from solders.solders import SimulateTransactionResp, AccountJSON, Account
 from solders.transaction import Transaction
 from solders.system_program import transfer, TransferParams
 
-from .logger import logger
+from app.core.logger import logger
 
 class AsyncRateLimiter:
     def __init__(self, max_calls: int, per_seconds: float):
