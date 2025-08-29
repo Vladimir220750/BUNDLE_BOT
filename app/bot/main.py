@@ -25,7 +25,7 @@ from .controller import BabloController
 from .handlers import router as handlers_router
 
 # ─── DRY MODE ─────────────────────────────────────────────────────────────────
-DRY_MODE = os.getenv("DRY_MODE", "1").lower() in ("1", "true", "on")
+DRY_MODE = SETTINGS.dry_mode
 if DRY_MODE:
     # заглушки для безопасного оффлайнового прогона
     try:
@@ -59,17 +59,15 @@ class ControllerMiddleware(BaseMiddleware):
 # ─── entrypoint ───────────────────────────────────────────────────────────────
 async def main():
     setup_logging()
-
-    # validate environment early
-    if not os.getenv("BOT_TOKEN"):
-        raise RuntimeError("BOT_TOKEN is not set. Put it to app/bot/.env or export env var before running.")
+    if (not SETTINGS.bot_token or not SETTINGS.admin_ids) and not DRY_MODE:
+        raise RuntimeError("BOT_TOKEN and ADMIN_IDS must be set when dry_mode is False")
 
     bot = Bot(token=SETTINGS.bot_token, parse_mode=ParseMode.HTML)
     dp = Dispatcher(storage=MemoryStorage())
 
     # Контроллер приложения
     cfg = load_config()
-    admin_chat_id = SETTINGS.admin_ids[0]
+    admin_chat_id = SETTINGS.admin_ids[0] if SETTINGS.admin_ids else 0
     controller = BabloController(cfg=cfg, bot=bot, admin_chat_id=admin_chat_id)
 
     # --- fallback: положим контроллер в диспетчер data, чтобы его можно было получить из handlers ---
