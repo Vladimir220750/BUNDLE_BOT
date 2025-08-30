@@ -1,20 +1,14 @@
 from __future__ import annotations
 
-import os
+import argparse
 import asyncio
 import signal
-import logging
 from typing import Optional
 
 from core.config import settings
 from core.bablo_bot import Bablo, BabloConfig
 from core.logger import logger as log
 from core.cli_config import get_cfg_from_user_cli, ainput
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message
-from bot.logs import TelegramErrorHandler
 
 _ca_queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -141,97 +135,17 @@ async def run_cli():
         await bablo.stop()
         log.info("CLI stopped.")
 
-async def run_bot():
-    if not settings.bot_token:
-        raise RuntimeError("BOT_TOKEN not provided in env")
-
-    bot = Bot(token=settings.bot_token, parse_mode=None)
-    dp = Dispatcher()
-
-    bablo = build_bablo()
-    status_chat_id: Optional[int] = None
-    log_handler: Optional[logging.Handler] = None
-
-    async def bot_on_status(text: str):
-        await on_status(text)
-
-    async def bot_on_alert(text: str):
-        nonlocal status_chat_id
-        await on_alert(text)
-        if status_chat_id:
-            try:
-                await bot.send_message(status_chat_id, f"⚠️ {text}")
-            except Exception:
-                pass
-
-    bablo.on_status = bot_on_status
-    bablo.on_alert = bot_on_alert
-
-    @dp.message(Command("start"))
-    async def cmd_start(m: Message):
-        nonlocal status_chat_id, log_handler
-        status_chat_id = m.chat.id
-        await m.answer("hi. use /start_bablo, /stop_bablo, /status, /mode <manual|auto>, /ca <mint>")
-        if log_handler is None:
-            handler = TelegramErrorHandler(bot.send_message, status_chat_id)
-            logging.getLogger("app.core").addHandler(handler)
-            log_handler = handler
-        await bot_on_status("Linked chat for status updates.")
-
-    @dp.message(Command("status"))
-    async def cmd_status(m: Message):
-        cfg = bablo.get_config()
-        await m.answer(
-            f"mode={cfg.mode}\n"
-            f"token_amounts={cfg.token_amount_ui}\n"
-            f"wsol_amounts={cfg.wsol_amount_ui}\n"
-            f"profit_threshold={cfg.profit_threshold_sol}\n"
-            f"timeout={cfg.cycle_timeout_sec}s\n"
-            f"auto_sleep={cfg.auto_sleep_sec}s"
-        )
-
-    @dp.message(Command("start_bablo"))
-    async def cmd_start_bablo(m: Message):
-        bablo.start()
-        await m.answer("bablo started")
-
-    @dp.message(Command("stop_bablo"))
-    async def cmd_stop_bablo(m: Message):
-        await bablo.stop()
-        await m.answer("bablo stopped")
-
-    @dp.message(Command("mode"))
-    async def cmd_mode(m: Message):
-        args = (m.text or "").split()
-        if len(args) < 2:
-            await m.answer("usage: /mode manual|auto")
-            return
-        await bablo.stop()
-        cfg = bablo.get_config()
-        cfg.mode = args[1].lower()
-        bablo.set_config(cfg)
-        await m.answer(f"mode set to {cfg.mode}")
-
-    @dp.message(F.text.regexp(r"^/ca\s+([1-9A-HJ-NP-Za-km-z]{32,44})$"))
-    async def cmd_ca(m: Message):
-        mint = m.text.split()[1]
-        await _ca_queue.put(mint)
-        await m.answer(f"queued CA: {mint}")
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
-
-    bablo.start()
-    try:
-        await dp.start_polling(bot, stop_signal=stop_event.wait())
-    finally:
-        await bablo.stop()
-        log.info("Bot stopped.")
 
 def main():
-    if settings.run_mode.lower() == "bot":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_mode", help="Run mode: cli or bot")
+    args = parser.parse_args()
+
+    mode = (args.run_mode or settings.run_mode).lower()
+
+    if mode == "bot":
+        from app.bot.runner import run as run_bot
+
         asyncio.run(run_bot())
     else:
         asyncio.run(run_cli())
