@@ -14,7 +14,7 @@ async def action_run(query: types.CallbackQuery) -> None:
     if not admin_check(query.from_user.id):
         await query.answer("Access denied.", show_alert=True)
         return
-    controller = query.bot.get("controller")
+    controller = getattr(query.bot, "controller", None)
     if controller and hasattr(controller, "start"):
         await maybe_await(controller.start())
         await query.message.reply("Controller.start() called.")
@@ -28,7 +28,7 @@ async def action_stop(query: types.CallbackQuery) -> None:
     if not admin_check(query.from_user.id):
         await query.answer("Access denied.", show_alert=True)
         return
-    controller = query.bot.get("controller")
+    controller = getattr(query.bot, "controller", None)
     if controller and hasattr(controller, "stop"):
         await maybe_await(controller.stop())
         await query.message.reply("Controller.stop() called.")
@@ -42,7 +42,7 @@ async def action_toggle_autorun(query: types.CallbackQuery) -> None:
     if not admin_check(query.from_user.id):
         await query.answer("Access denied.", show_alert=True)
         return
-    controller = query.bot.get("controller")
+    controller = getattr(query.bot, "controller", None)
     if controller and hasattr(controller, "cfg"):
         cfg = controller.cfg
         autorun = getattr(cfg, "autorun", False)
@@ -71,7 +71,7 @@ async def cmd_run(message: types.Message) -> None:
     if not admin_check(message.from_user.id):
         await message.reply("Access denied.")
         return
-    controller = message.bot.get("controller")
+    controller = getattr(message.bot, "controller", None)
     if controller and hasattr(controller, "start"):
         await maybe_await(controller.start())
         await message.reply("Run requested.")
@@ -84,7 +84,7 @@ async def cmd_stop(message: types.Message) -> None:
     if not admin_check(message.from_user.id):
         await message.reply("Access denied.")
         return
-    controller = message.bot.get("controller")
+    controller = getattr(message.bot, "controller", None)
     if controller and hasattr(controller, "stop"):
         await maybe_await(controller.stop())
         await message.reply("Stop requested.")

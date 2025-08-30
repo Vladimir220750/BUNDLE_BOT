@@ -24,7 +24,7 @@ async def receive_ca(message: types.Message, state: FSMContext) -> None:
         await state.clear()
         return
     ca = message.text.strip()
-    controller = message.bot.get("controller")
+    controller = getattr(message.bot, "controller", None)
     if controller and hasattr(controller, "set_ca"):
         try:
             await maybe_await(controller.set_ca(ca))

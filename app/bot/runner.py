@@ -26,7 +26,8 @@ async def run() -> None:
     cfg = load_config()
     admin_id = SETTINGS.admin_ids[0] if SETTINGS.admin_ids else None
     controller = BabloController(cfg, bot, admin_id)
-    bot["controller"] = controller
+    bot.controller = controller
+    dp.controller = controller
     boot_chat_id = SETTINGS.boot_chat_id or admin_id
     if boot_chat_id:
         await bot.send_message(boot_chat_id, "✅ Bot up (mode=bot)")

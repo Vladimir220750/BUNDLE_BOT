@@ -15,7 +15,7 @@ async def action_status(query: types.CallbackQuery) -> None:
     if not admin_check(query.from_user.id):
         await query.answer("Access denied.", show_alert=True)
         return
-    controller = query.bot.get("controller")
+    controller = getattr(query.bot, "controller", None)
     if controller and hasattr(controller, "status"):
         try:
             st = await maybe_await(controller.status())
@@ -33,7 +33,7 @@ async def action_show_config(query: types.CallbackQuery) -> None:
     if not admin_check(query.from_user.id):
         await query.answer("Access denied.", show_alert=True)
         return
-    controller = query.bot.get("controller")
+    controller = getattr(query.bot, "controller", None)
     cfg = getattr(controller, "cfg", None)
     await query.message.reply(f"<b>Config:</b>\n<pre>{escape(str(cfg))}</pre>", parse_mode="HTML")
     await query.answer()
@@ -44,7 +44,7 @@ async def cmd_status(message: types.Message) -> None:
     if not admin_check(message.from_user.id):
         await message.reply("Access denied.")
         return
-    controller = message.bot.get("controller")
+    controller = getattr(message.bot, "controller", None)
     if controller and hasattr(controller, "status"):
         try:
             st = await maybe_await(controller.status())
