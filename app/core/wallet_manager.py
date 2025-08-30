@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base58
 
 import os
@@ -49,6 +50,8 @@ class WalletManager:
 
         self._dev = self._create_dev()
 
+        self._dev_lock = asyncio.Lock()
+
     @property
     def fund(self) -> Keypair:
         return self._fund
@@ -65,48 +68,120 @@ class WalletManager:
     def dev_pubkey(self) -> Pubkey:
         return self._dev.keypair.pubkey()
 
-    async def distribute_lamports(self, lamports: int) -> str:
+    async def _distribute_lamports_unlocked(self, lamports: int) -> str:
         if lamports <= 0:
             raise ValueError("lamports must be > 0")
-        ix = transfer(TransferParams(from_pubkey=self.fund_pubkey, to_pubkey=self.dev_pubkey, lamports=lamports))
+        ix = transfer(TransferParams(
+            from_pubkey=self.fund_pubkey,
+            to_pubkey=self.dev_pubkey,
+            lamports=lamports
+        ))
         sig, _ = await self.client.build_and_send_transaction(
             instructions=[ix],
             msg_signer=self._fund,
             signers_keypairs=[self._fund],
             max_retries=1,
             max_confirm_retries=10,
-            label="FUND→DEV",
+            label="FUND -> DEV",
             priority_fee=10_000,
         )
         return str(sig)
 
-    async def withdraw_to_fund(self, lamports: Optional[int] = None) -> str:
-        lamports_balance = (await self.client.get_multiple_accounts_lamports_balances([self.dev_pubkey]))[0]
-        amount = lamports if lamports is not None else max(0, lamports_balance)
-        if amount <= 0:
-            raise RuntimeError("Nothing to withdraw from dev wallet")
+    async def _withdraw_to_fund_unlocked(
+        self,
+        lamports: Optional[int] = None,
+        *,
+        from_dev: Optional[Keypair] = None,
+        wait_if_zero: bool = True,
+    ) -> str:
+        dev_kp = from_dev or self._dev.keypair
+        dev_pk = dev_kp.pubkey()
 
-        ix = transfer(TransferParams(from_pubkey=self.dev_pubkey, to_pubkey=self.fund_pubkey, lamports=amount))
+        bal = (await self.client.get_multiple_accounts_lamports_balances([dev_pk]))[0]
+        if bal == 0 and wait_if_zero:
+            bal = await self._wait_nonzero_balance(dev_pk)
+
+        amount = lamports if lamports is not None else max(0, bal)
+        if amount <= 0:
+            raise RuntimeError(f"Nothing to withdraw from dev wallet: {str(dev_pk)}")
+
+        ix = transfer(TransferParams(from_pubkey=dev_pk, to_pubkey=self.fund_pubkey, lamports=amount))
         sig, _ = await self.client.build_and_send_transaction(
             instructions=[ix],
-            msg_signer=self._dev.keypair,
-            signers_keypairs=[self._dev.keypair],
+            msg_signer=self._fund,
+            signers_keypairs=[self._fund, dev_kp],
             max_retries=1,
             max_confirm_retries=10,
-            label="DEV→FUND",
+            label="DEV -> FUND",
             priority_fee=10_000,
         )
         return str(sig)
+
+    async def distribute_lamports(self, lamports: int) -> str:
+        async with self._dev_lock:
+            return await self._distribute_lamports_unlocked(lamports)
+
+    async def withdraw_to_fund(
+        self,
+        lamports: Optional[int] = None,
+        from_dev: Optional[Keypair] = None,
+        wait_if_zero: bool = True,
+    ) -> str:
+        async with self._dev_lock:
+            return await self._withdraw_to_fund_unlocked(
+                lamports=lamports,
+                from_dev=from_dev,
+                wait_if_zero=wait_if_zero,
+            )
+
+    async def _wait_nonzero_balance(
+        self,
+        pubkey: Pubkey,
+        *,
+        min_lamports: int = 1,
+        timeout_sec: float = 5.0,
+        poll_interval: float = 1.0,
+    ) -> int:
+
+        deadline = asyncio.get_running_loop().time() + timeout_sec
+        last = 0
+        while asyncio.get_running_loop().time() < deadline:
+            bal = (await self.client.get_multiple_accounts_lamports_balances([pubkey]))[0]
+            last = bal
+            if bal >= min_lamports:
+                return bal
+            await asyncio.sleep(poll_interval)
+        return last
 
     def update_dev(self) -> Keypair:
         self._dev = self._create_dev()
         return self._dev.keypair
 
-    async def rollover_dev(self, seed_lamports: int) -> tuple[str, str]:
-        sig1 = await self.withdraw_to_fund(lamports=None)
-        self.update_dev()
-        sig2 = await self.distribute_lamports(seed_lamports)
-        return sig1, sig2
+    async def rollover_dev(
+            self, seed_lamports: int, *, from_dev: Optional[Keypair] = None
+    ) -> tuple[str, str]:
+        old_dev = from_dev or self._dev.keypair
+        async with self._dev_lock:
+            #sig1 = await self._withdraw_to_fund_unlocked(from_dev=old_dev)
+            self.update_dev()
+            sig2 = await self._distribute_lamports_unlocked(seed_lamports)
+            return "", sig2
+
+    class _DevCycleCtx:
+        def __init__(self, wm: "WalletManager"):
+            self.wm = wm
+            self.dev_snapshot: Optional[Keypair] = None
+
+        async def __aenter__(self):
+            await self.wm._dev_lock.acquire()
+            self.dev_snapshot = self.wm._dev.keypair
+            return self.dev_snapshot
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.wm._dev_lock.release()
+
+    def dev_cycle(self) -> "_DevCycleCtx":
+        return WalletManager._DevCycleCtx(self)
 
     @staticmethod
     def get_wsol_ata(owner: Pubkey) -> Pubkey:

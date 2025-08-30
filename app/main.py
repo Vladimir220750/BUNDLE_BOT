@@ -95,6 +95,7 @@ async def run_cli():
                     "  mode manual|auto       - change bablo mode (applies next idle)\n"
                     "  status                 - print brief status\n"
                     "  exit                   - quit\n"
+                    "  withdraw               - withdraw from dev to fund\n"
                 )
                 continue
 
@@ -126,6 +127,11 @@ async def run_cli():
                 mint = parts[1]
                 await _ca_queue.put(mint)
                 print(f"queued CA: {mint}")
+                continue
+
+            if head == "withdraw":
+                await bablo.handle_withdraw_to_fund()
+                print("withdraw")
                 continue
 
             print("unknown command. Type 'help'.")

@@ -102,37 +102,37 @@ class WsHub:
         }))
 
     @staticmethod
-    async def _read_loop(
-        ws,
-        pubkey: str,
-        on_change: LamportsHandler,
-        stop_event: asyncio.Event,
-    ) -> None:
-        async for raw in ws:
-            if stop_event.is_set():
+    async def _read_loop(ws, pubkey: str, on_change: LamportsHandler, stop_event: asyncio.Event):
+        while not stop_event.is_set():
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
                 break
             try:
                 msg = json.loads(raw)
-            except Exception:
-                continue
-
-            params = msg.get("params")
-            if not params:
-                continue
-            value = params.get("result", {}).get("value", {})
-            lamports = value.get("lamports")
-            if lamports is None:
-                continue
-            try:
+                params = msg.get("params")
+                if not params:
+                    continue
+                value = params.get("result", {}).get("value", {})
+                lamports = value.get("lamports")
+                if lamports is None:
+                    continue
                 await on_change(lamports)
             except Exception as e:
                 log.error("[WS] handler error for %s: %s", pubkey, e)
 
     @staticmethod
     async def _ping_loop(ws, stop_event: asyncio.Event, *, interval: float = 20.0):
+        tick = 0.5
+        elapsed = 0.0
         while not stop_event.is_set():
-            try:
-                await ws.ping()
-            except Exception:
-                break
-            await asyncio.sleep(interval)
+            if elapsed >= interval:
+                try:
+                    await ws.ping()
+                except Exception:
+                    break
+                elapsed = 0.0
+            await asyncio.sleep(tick)
+            elapsed += tick
