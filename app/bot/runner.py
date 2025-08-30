@@ -1,5 +1,3 @@
-import os
-
 from aiogram import Bot, Dispatcher
 
 from .handlers import routers
@@ -26,11 +24,10 @@ async def run() -> None:
     dp = create_dispatcher()
 
     cfg = load_config()
-    admin_ids = getattr(SETTINGS, "admin_ids", [])
-    admin_id = admin_ids[0] if admin_ids else None
+    admin_id = SETTINGS.admin_ids[0] if SETTINGS.admin_ids else None
     controller = BabloController(cfg, bot, admin_id)
     bot["controller"] = controller
-    boot_chat_id = os.getenv("TELEGRAM_BOOT_CHAT_ID") or admin_id
+    boot_chat_id = SETTINGS.boot_chat_id or admin_id
     if boot_chat_id:
         await bot.send_message(boot_chat_id, "✅ Bot up (mode=bot)")
         await bot.send_message(boot_chat_id, "Меню настроек", reply_markup=main_menu_kb())
