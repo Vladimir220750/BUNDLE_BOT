@@ -40,7 +40,7 @@ async def receive_param_value(message: types.Message, state: FSMContext) -> None
         return
     data = await state.get_data()
     key = data.get("param_key")
-    controller = message.bot.get("controller")
+    controller = getattr(message.bot, "controller", None)
     success, msg = await _apply_config(controller, key, message.text)
     await message.reply(msg, parse_mode="HTML")
     await state.clear()
