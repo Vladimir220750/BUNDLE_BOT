@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import asyncio
 import signal
+import logging
 from typing import Optional
 
 from core.config import settings
@@ -13,6 +14,7 @@ from core.cli_config import get_cfg_from_user_cli, ainput
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
+from bot.logs import TelegramErrorHandler
 
 _ca_queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -148,15 +150,10 @@ async def run_bot():
 
     bablo = build_bablo()
     status_chat_id: Optional[int] = None
+    log_handler: Optional[logging.Handler] = None
 
     async def bot_on_status(text: str):
-        nonlocal status_chat_id
         await on_status(text)
-        if status_chat_id:
-            try:
-                await bot.send_message(status_chat_id, text)
-            except Exception:
-                pass
 
     async def bot_on_alert(text: str):
         nonlocal status_chat_id
@@ -172,9 +169,13 @@ async def run_bot():
 
     @dp.message(Command("start"))
     async def cmd_start(m: Message):
-        nonlocal status_chat_id
+        nonlocal status_chat_id, log_handler
         status_chat_id = m.chat.id
         await m.answer("hi. use /start_bablo, /stop_bablo, /status, /mode <manual|auto>, /ca <mint>")
+        if log_handler is None:
+            handler = TelegramErrorHandler(bot.send_message, status_chat_id)
+            logging.getLogger("app.core").addHandler(handler)
+            log_handler = handler
         await bot_on_status("Linked chat for status updates.")
 
     @dp.message(Command("status"))
