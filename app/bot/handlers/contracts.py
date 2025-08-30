@@ -28,7 +28,7 @@ async def receive_ca(message: types.Message, state: FSMContext) -> None:
     if controller and hasattr(controller, "set_ca"):
         try:
             await maybe_await(controller.set_ca(ca))
-            await message.reply(f"CA set to <code>{ca}</code> via controller.set_ca()", parse_mode="HTML")
+            await message.reply(f"CA stored: <code>{ca}</code>", parse_mode="HTML")
             await state.clear()
             return
         except Exception as e:

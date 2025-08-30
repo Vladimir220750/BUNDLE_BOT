@@ -17,6 +17,7 @@ from app.core.wallet_manager import WalletManager     # у тебя этот к�
 from app.core.client import SolanaClient     # как в твоих модулях
 
 from .config import AppConfig, save_config
+from .storage import load_contracts, save_contracts
 from .logs import TelegramLogHandler
 
 
@@ -160,9 +161,13 @@ class BabloController:
             await self._send(f"🟠 <b>Alert</b>\n<pre>{safe}</pre>")
 
         async def get_ca() -> str:
-            ca = self.cfg.bablo.last_ca
-            if not ca:
+            contracts = load_contracts()
+            if not contracts:
                 raise RuntimeError("CA не задан. Используй /set_ca <MINT>")
+            ca = contracts.pop(0)
+            save_contracts(contracts)
+            self.cfg.bablo.last_ca = ca
+            save_config(self.cfg)
             return ca
 
         b = Bablo(
@@ -191,9 +196,13 @@ class BabloController:
 
     # ---------- Public API ----------
     async def set_ca(self, ca: str):
-        self.cfg.bablo.last_ca = ca.strip()
+        clean = ca.strip()
+        contracts = load_contracts()
+        contracts.append(clean)
+        save_contracts(contracts)
+        self.cfg.bablo.last_ca = clean
         save_config(self.cfg)
-        await self._send(f"📌 Установлен CA: <code>{escape(self.cfg.bablo.last_ca)}</code>")
+        await self._send(f"📌 Добавлен CA: <code>{escape(clean)}</code>")
 
     async def set_param(self, key: str, value: str):
         bcfg = self.cfg.bablo
