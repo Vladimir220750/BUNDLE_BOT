@@ -17,7 +17,69 @@ from app.core.wallet_manager import WalletManager     # у тебя этот к�
 from app.core.client import SolanaClient     # как в твоих модулях
 
 from .config import AppConfig, save_config
-from .telelog import TelegramLogHandler
+from .logs import TelegramLogHandler
+
+
+async def maybe_await(maybe_awaitable):
+    """Позволяет вызывать как sync, так и async функции."""
+    if hasattr(maybe_awaitable, "__await__"):
+        return await maybe_awaitable
+    return maybe_awaitable
+
+
+def cast_string_to_type(s: str):
+    """Приведение строкового ввода к числам, спискам или bool."""
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    try:
+        if "." in s:
+            return float(s)
+    except Exception:
+        pass
+    if s.lower() in ("true", "1", "yes", "on"):
+        return True
+    if s.lower() in ("false", "0", "no", "off"):
+        return False
+    if " " in s or "," in s:
+        parts = [p.strip() for p in (s.replace(",", " ").split()) if p.strip()]
+        converted = []
+        for p in parts:
+            if p.isdigit():
+                converted.append(int(p))
+            else:
+                try:
+                    converted.append(float(p))
+                except Exception:
+                    converted.append(p)
+        return converted
+    return s
+
+
+async def _apply_config(controller, key: str, value: str) -> tuple[bool, str]:
+    """Попытаться применить изменение конфигурации к контроллеру."""
+    try:
+        if hasattr(controller, "update_config"):
+            await maybe_await(controller.update_config(key, value))
+            return True, f"Param <b>{escape(key)}</b> updated via controller.update_config."
+    except Exception as e:
+        return False, f"update_config failed: {escape(str(e))}"
+
+    try:
+        cfg = getattr(controller, "cfg", None)
+        if cfg is None:
+            return False, "Controller has no cfg attribute; cannot apply."
+        cast_val = cast_string_to_type(value)
+        if hasattr(cfg, key):
+            setattr(cfg, key, cast_val)
+            return True, f"Param <b>{escape(key)}</b> set to <code>{escape(str(value))}</code> on cfg."
+        try:
+            setattr(cfg, key, cast_val)
+            return True, f"Param <b>{escape(key)}</b> created/updated on cfg."
+        except Exception as e:
+            return False, f"Cannot set attribute {escape(key)} on cfg: {escape(str(e))}"
+    except Exception as e:
+        return False, f"Failed to apply config: {escape(str(e))}"
 
 log = logging.getLogger("tg-controller")
 
